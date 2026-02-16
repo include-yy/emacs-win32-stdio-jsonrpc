@@ -1,3 +1,71 @@
 * A simple JSON-RPC implementation in C++ for Emacs
 
+A lightweight, header-only JSON-RPC 2.0 server implementation designed
+for Windows.
+
+It serves as a bridge between Emacs and Windows-specific capabilities,
+such as hosting Microsoft Edge WebView2 content, by communicating over
+standard input/output (Stdio) using the Language Server Protocol (LSP)
+framing.
+
+It use [[https://github.com/nlohmann/json][nlohmann/json]] to parse JSON string. 
+
+** Getting Started
+
+*Prerequisites*
+
+- Visual Studio with v145 for Microsoft C++ Build Tools, ISO C++20
+
+Then, Just grab the files from include and drop them into your project.
+
+** Usage
+
+*C++ Server Side*
+
+Define your methods and start the server. The server runs a background
+thread for reading stdin, while execution happens on your main thread.
+
+#+begin_src cpp
+  #include "jsonrpc.hpp"
+
+  jsonrpc::Conn server;
+
+  int main() {
+      server.register_method("add", [](const jsonrpc::json& params) -> jsonrpc::json {
+          return params[0].get<double>() + params[1].get<double>();
+      });
+
+      server.start();
+
+      MSG msg;
+      while (GetMessage(&msg, nullptr, 0, 0)) {
+          if (msg.message == WM_JSONRPC_MESSAGE) {
+              server.process_queue();
+          } else {
+              TranslateMessage(&msg);
+              DispatchMessage(&msg);
+          }
+      }
+      return 0;
+  }
+#+end_src
+
+*Emacs Client Side*
+
+Use the built-in jsonrpc.el library to communicate with the generated
+executable.
+
+#+begin_src elisp
+  (require 'jsonrpc)
+  (setq rpc (make-instance
+             'jsonrpc-process-connection
+  	   :name "example"
+  	   :process (make-process
+  		     :name "exe"
+  		     :command '("path/to/exe")
+  		     :coding 'binary)))
+
+  (jsonrpc-request rpc "add" [1 2])
+  ;;=> 3.0
+#+end_src
 
