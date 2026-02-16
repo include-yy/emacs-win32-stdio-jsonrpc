@@ -59,11 +59,11 @@ executable.
   (require 'jsonrpc)
   (setq rpc (make-instance
              'jsonrpc-process-connection
-  	   :name "example"
-  	   :process (make-process
-  		     :name "exe"
-  		     :command '("path/to/exe")
-  		     :coding 'binary)))
+             :name "example"
+             :process (make-process
+                       :name "exe"
+                       :command '("path/to/exe")
+                       :coding 'binary)))
 
   (jsonrpc-request rpc "add" [1 2])
   ;;=> 3.0
