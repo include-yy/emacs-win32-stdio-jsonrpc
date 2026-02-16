@@ -8,7 +8,7 @@ such as hosting Microsoft Edge WebView2 content, by communicating over
 standard input/output (Stdio) using the Language Server Protocol (LSP)
 framing.
 
-It use [[https://github.com/nlohmann/json][nlohmann/json]] to parse JSON string. 
+It use [[https://github.com/nlohmann/json][nlohmann/json]]([[https://github.com/nlohmann/json/releases/tag/v3.12.0][version 3.12.0]]) to parse JSON string. 
 
 ** Getting Started
 
