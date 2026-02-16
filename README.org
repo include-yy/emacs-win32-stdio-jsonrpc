@@ -16,7 +16,9 @@ It use [[https://github.com/nlohmann/json][nlohmann/json]] to parse JSON string.
 
 - Visual Studio with v145 for Microsoft C++ Build Tools, ISO C++20
 
-Then, Just grab the files from include and drop them into your project.
+Then, Just grab the files from include and drop them into your
+project. Hopefully the code and comments are clear enough for you to
+figure out how the functions work. :)
 
 ** Usage
 
@@ -54,6 +56,10 @@ thread for reading stdin, while execution happens on your main thread.
 
 Use the built-in jsonrpc.el library to communicate with the generated
 executable.
+
+/Note: The =:coding 'binary= (or =no-conversion=) is critical on
+Windows. Without it, Emacs may convert =\n= to =\r\n=, breaking the
+=Content-Length= byte counting./
 
 #+begin_src elisp
   (require 'jsonrpc)
