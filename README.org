@@ -57,9 +57,9 @@ thread for reading stdin, while execution happens on your main thread.
 Use the built-in jsonrpc.el library to communicate with the generated
 executable.
 
-/Note: The =:coding 'binary= (or =no-conversion=) is critical on
+*Note*: The =:coding 'binary= (or =no-conversion=) is critical on
 Windows. Without it, Emacs may convert =\n= to =\r\n=, breaking the
-=Content-Length= byte counting./
+=Content-Length= byte counting.
 
 #+begin_src elisp
   (require 'jsonrpc)
