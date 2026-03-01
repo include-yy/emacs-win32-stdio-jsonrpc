@@ -355,13 +355,22 @@ public:
 
     // Constructor: waker is called whenever a new message arrives in the queue.
     // Use it to wake up your main event loop.
-    Conn(Waker waker, size_t max_pkg_size = kDefaultMaxContentLength)
-        : next_id_(1), running_(false), waker_(std::move(waker)), max_content_length_(max_pkg_size) {
+    Conn(Waker waker,
+        std::istream& input = std::cin,
+        std::ostream& output = std::cout,
+        std::ostream& error = std::cerr,
+        size_t max_pkg_size = kDefaultMaxContentLength)
+        : running_(false), next_id_(1), waker_(waker),
+        in_(input), out_(output), err_(error), max_content_length_(max_pkg_size) {
         // Force Windows stdin/stdout into binary mode to prevent \r\n translation.
         // Critical for correct Content-Length calculation.
 #ifdef _WIN32
-        (void)_setmode(_fileno(stdin), _O_BINARY);
-        (void)_setmode(_fileno(stdout), _O_BINARY);
+        if (&input == &std::cin) {
+            (void)_setmode(_fileno(stdin), _O_BINARY);
+        }
+        if (&output == &std::cout) {
+            (void)_setmode(_fileno(stdout), _O_BINARY);
+        }
 #endif
     }
 
@@ -513,6 +522,10 @@ private:
     std::map<std::string, AsyncRequestHandler> method_handlers_;
     std::map<int, ResponseHandler> pending_callbacks_;
 
+    std::istream& in_;
+    std::ostream& out_;
+    std::ostream& err_;
+
     // Thread-safe message sender.
     void send_message(const std::string& body) {
         // std::osyncstream will atomically write the buffer to the stream
@@ -520,7 +533,7 @@ private:
 
         // Emacs's jsonrpc use a HTTP-like framing with Content-Length header,
         // Content-Length: <length>\r\n\r\n<body>
-        std::osyncstream(std::cout)
+        std::osyncstream(out_)
             << "Content-Length: " << body.length() << "\r\n"
             << "\r\n" << body << std::flush;
     }
@@ -593,9 +606,9 @@ private:
             }
         } exit_guard{ running_, waker_ };
         // A helper function that reads a line and automatically removes '\r' character.
-        auto read_header_line = []() -> std::optional<std::string> {
+        auto read_header_line = [this]() -> std::optional<std::string> {
             std::string line;
-            if (!std::getline(std::cin, line)) {
+            if (!std::getline(in_, line)) {
                 return std::nullopt;  // EOF or stream error
             }
             if (!line.empty() && line.back() == '\r') {
@@ -613,31 +626,31 @@ private:
                 if (!line) return;  // EOF
                 if (line->empty()) break;  // End of headers.
 
-                if (line->starts_with("Content-Length: ")) {
-                    // "Content-Length: " length is 16.
+                if (line->starts_with("Content-Length:")) {
                     try {
-                        content_length = std::stoull(line->substr(16));
+                        auto pos = line->find(':');
+                        content_length = std::stoull(line->substr(pos + 1));
                     } catch (...) { }
                 }
             }
             // Invalid content length.
             if (content_length == 0) {
-                std::cerr << "[JSON-RPC FATAL] Missing Content-Length header."
+                err_ << "[JSON-RPC FATAL] Missing Content-Length header."
                     << std::endl;
                 return;
             }
             if (content_length > max_content_length_) {
-                std::cerr << "[JSON-RPC FATAL] Packet too large: "
+                err_ << "[JSON-RPC FATAL] Packet too large: "
                     << content_length << "> " << max_content_length_
                     << ". Closing connection." << std::endl;
                 return;
             }
             // 2. Read body.
             std::vector<char> buffer(content_length);
-            std::cin.read(buffer.data(), content_length);
+            in_.read(buffer.data(), content_length);
 
             // Make sure we read the exact number of bytes specified.
-            if (std::cin.gcount() != (std::streamsize)content_length) break;
+            if (in_.gcount() != (std::streamsize)content_length) break;
 
             // 3. Parse and Push.
             try {

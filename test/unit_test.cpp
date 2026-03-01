@@ -1,9 +1,13 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 #include "jsonrpc.hpp"
+#include <sstream>
+#include <chrono>
+#include <thread>
 
 using namespace jsonrpc;
 using json = nlohmann::json;
+using namespace std::chrono_literals;
 
 #define CHECK_JSONRPC_EXCEPTION(statement, expected_code)            \
     try {                                                            \
@@ -235,4 +239,331 @@ TEST_CASE("Parser Advanced Boundaries") {
         json j = json::array();
         CHECK_JSONRPC_EXCEPTION(Parser::parse(j), spec::kInvalidRequest);
     }
+}
+
+static void write_rpc_packet(std::ostream& os, const std::string& body) {
+    os << "Content-Length: " << body.length() << "\r\n\r\n" << body << std::flush;
+}
+
+TEST_CASE("Conn: I/O Failure") {
+    std::stringstream mock_in;
+    std::stringstream mock_out;
+    std::stringstream mock_err;
+
+    bool waked = false;
+    Conn conn([&]() { waked = true; }, mock_in, mock_out, mock_err, 1024);
+
+    SUBCASE("Immediate EOF: Empty stream") {
+        std::stringstream empty_in("");
+        Conn eof_conn([]() {}, empty_in, mock_out, mock_err);
+
+        eof_conn.start();
+        std::this_thread::sleep_for(10ms);
+
+        CHECK_FALSE(eof_conn.is_running());
+    }
+
+    SUBCASE("Partial EOF: Stream ends mid-body") {
+        conn.start();
+        mock_in << "Content-Length: 100\r\n\r\nPartial";
+
+        std::this_thread::sleep_for(10ms);
+        CHECK_FALSE(conn.is_running());
+        CHECK(waked);
+    }
+
+    SUBCASE("Malformed header: missing length value") {
+        conn.start();
+        mock_in << "Content-Length: \r\n\r\n{}";
+        std::this_thread::sleep_for(10ms);
+        CHECK_FALSE(conn.is_running());
+        CHECK(waked);
+    }
+
+    SUBCASE("Malformed header: invalid length") {
+        conn.start();
+        mock_in << "Content-Length: ABC \r\n\r\n{}";
+        std::this_thread::sleep_for(10ms);
+        CHECK_FALSE(conn.is_running());
+        CHECK(waked);
+    }
+
+    SUBCASE("Malformed header: incorrect spelling") {
+        conn.start();
+        mock_in << "CONTENT-LENGTH: 123 \r\n\r\n{}";
+        std::this_thread::sleep_for(10ms);
+        CHECK_FALSE(conn.is_running());
+        CHECK(waked);
+    }
+
+    SUBCASE("Oversized packet rejection") {
+        conn.start();
+        mock_in << "Content-Length: 2000\r\n\r\n{}";
+        std::this_thread::sleep_for(10ms);
+        CHECK_FALSE(conn.is_running());
+        CHECK(mock_err.str().find("Packet too large") != std::string::npos);
+        CHECK(waked);
+    }
+}
+
+TEST_CASE("Conn: Protocol Robustness (Recoverable)") {
+    std::stringstream mock_in, mock_out, mock_err;
+    Conn conn([]() {}, mock_in, mock_out, mock_err);
+    conn.start();
+
+    SUBCASE("Broken JSON Body - Should stay alive and reply error") {
+        write_rpc_packet(mock_in, R"({"jsonrpc":"2.0", "method": "test)");
+        write_rpc_packet(mock_in, R"({"jsonrpc":"2.0", "method": "ping", "id": 2})");
+        
+        std::this_thread::sleep_for(10ms);
+        conn.process_queue();
+        CHECK(mock_out.str().find("-32700") != std::string::npos);
+        CHECK(mock_out.str().find(R"("id":2)") != std::string::npos);
+    }
+
+    SUBCASE("Header Robustness: Whitespace flexibility") {
+        conn.start();
+        // 1 space
+        mock_in << "Content-Length: 22\r\n\r\n{\"id\":1, \"method\":\"a\"}";
+        // 0 space
+        mock_in << "Content-Length:22\r\n\r\n{\"id\":2, \"method\":\"a\"}";
+        // many space
+        mock_in << "Content-Length:   22\r\n\r\n{\"id\":3, \"method\":\"a\"}";
+        std::this_thread::sleep_for(20ms);
+        conn.process_queue();
+
+        CHECK(mock_out.str().find(R"("id":1)") != std::string::npos);
+        CHECK(mock_out.str().find(R"("id":2)") != std::string::npos);
+        CHECK(mock_out.str().find(R"("id":3)") != std::string::npos);
+
+        conn.stop();
+    }
+
+    conn.stop();
+}
+
+TEST_CASE("Conn: Application Logic (Normal)") {
+    std::stringstream in, out, err;
+    Conn conn([]() {}, in, out, err);
+
+    SUBCASE("Synchronous Method: add") {
+        conn.register_method("add", [](const json& p) {
+            return p[0].get<int>() + p[1].get<int>();
+            });
+
+        conn.start();
+        write_rpc_packet(in, R"({"jsonrpc":"2.0","method":"add","params":[10,20],"id":1})");
+
+        std::this_thread::sleep_for(20ms);
+        conn.process_queue();
+
+        CHECK(out.str().find(R"("result":30)") != std::string::npos);
+        CHECK(out.str().find(R"("id":1)") != std::string::npos);
+        conn.stop();
+    }
+
+    SUBCASE("Asynchronous Method: delayed_reply") {
+        conn.register_async_method("delay", [](Context ctx, const json& p) {
+            std::thread([ctx, p]() mutable {
+                std::this_thread::sleep_for(10ms);
+                ctx.reply(p[0].get<std::string>());
+                }).detach();
+            });
+
+        conn.start();
+        write_rpc_packet(in, R"({"jsonrpc":"2.0","method":"delay","params":["ok"],"id":42})");
+
+        std::this_thread::sleep_for(10ms);
+        conn.process_queue();
+
+        std::this_thread::sleep_for(30ms);
+        CHECK(out.str().find(R"("result":"ok")") != std::string::npos);
+        CHECK(out.str().find(R"("id":42)") != std::string::npos);
+        conn.stop();
+    }
+
+    SUBCASE("Notification: log_event") {
+        std::string logs;
+        conn.register_notification("log", [&](const json& p) {
+            logs = p[0].get<std::string>();
+            });
+
+        conn.start();
+        write_rpc_packet(in, R"({"jsonrpc":"2.0","method":"log","params":["hello"]})");
+
+        std::this_thread::sleep_for(10ms);
+        conn.process_queue();
+
+        CHECK(logs == "hello");
+        CHECK(out.str().empty());
+        conn.stop();
+    }
+}
+
+TEST_CASE("Conn: Boundary Errors (Spec Validation)") {
+    std::stringstream in, out, err;
+    Conn conn([]() {}, in, out, err);
+    auto test = [&](std::string input, const char* msg) -> void {
+        out.clear();
+        in.clear();
+        conn.start();
+        write_rpc_packet(in, input);
+        std::this_thread::sleep_for(10ms);
+        conn.process_queue();
+        CHECK(out.str().find(msg) != std::string::npos);
+        conn.stop();
+        };
+
+    SUBCASE("Parser Level Errors") {
+        // parse_not_object
+        test(R"([1, 2, 3])", spec::details::parse_not_object);
+        // parse_broken
+        test(R"({"foo": "bar"})", spec::details::parse_broken);
+        // parse_id_null_no_error
+        test(R"({"jsonrpc":"2.0", "id": null})", spec::details::parse_id_null_no_error);
+        // parse_id_type
+        test(R"({"jsonrpc":"2.0", "id": 1.23})", spec::details::parse_id_type);
+    }
+
+    SUBCASE("Request Object Validation") {
+        // req_method_miss
+        test(R"({"jsonrpc":"2.0", "method": 123, "id": 1})", spec::details::req_method_miss);
+        // req_id_type
+        test(R"({"jsonrpc":"2.0", "method": "test", "id": "string_id"})", spec::details::req_id_type);
+        // req_params_type
+        test(R"({"jsonrpc":"2.0", "method": "test", "params": "string"})", spec::details::req_params_type);
+    }
+
+    SUBCASE("Response Object Validation") {
+        // resp_missing_id
+        // resp_id_type
+
+        // resp_conflict
+        test(R"({"jsonrpc":"2.0", "id": 1, "result": {}, "error": {"code":1,"message":"x"}})", spec::details::resp_conflict);
+        // resp_incomplete
+        test(R"({"jsonrpc":"2.0", "id": 1})", spec::details::resp_incomplete);
+    }
+
+    SUBCASE("Error Object Validation") {
+        // err_code_miss
+        test(R"({"jsonrpc":"2.0", "id": null, "error": {"message": "no code"}})", spec::details::err_code_miss);
+        // err_code_type
+        test(R"({"jsonrpc":"2.0", "id": null, "error": {"code": "1", "message": "msg"}})", spec::details::err_code_type);
+        // err_msg_miss
+        test(R"({"jsonrpc":"2.0", "id": null, "error": {"code": 1}})", spec::details::err_msg_miss);
+        // err_msg_type
+        test(R"({"jsonrpc":"2.0", "id": null, "error": {"code": 1, "message": 123}})", spec::details::err_msg_type);
+    }
+}
+
+TEST_CASE("Conn: Active Client Logic (Outbound)") {
+    std::stringstream in, out, err;
+    Conn conn([]() {}, in, out, err);
+
+    SUBCASE("Send Request & Handle Successful Response") {
+        bool handled = false;
+        conn.send_request("query", { {"id", "user1"} }, [&](const Response& resp) {
+            handled = true;
+            CHECK(std::get<json>(resp.content)["status"] == "active");
+           });
+        CHECK(out.str().find(R"("id":1)") != std::string::npos);
+
+        write_rpc_packet(in, R"({"jsonrpc":"2.0", "id": 1, "result": {"status": "active"}})");
+        conn.start();
+        std::this_thread::sleep_for(10ms);
+        conn.process_queue();
+        CHECK(handled);
+    }
+
+    SUBCASE("Send Request & Handle Error Response") {
+        bool handled = false;
+        conn.send_request("risky_call", nullptr, [&](const Response& resp) {
+            handled = true;
+            CHECK(resp.is_error());
+            auto& err = std::get<Error>(resp.content);
+            CHECK(err.code == -1);
+            CHECK(err.message == "fail");
+            });
+
+        write_rpc_packet(in, R"({"jsonrpc":"2.0", "id": 1, "error": {"code": -1, "message": "fail"}})");
+        conn.start();
+        std::this_thread::sleep_for(10ms);
+        conn.process_queue();
+        CHECK(handled);
+    }
+
+    SUBCASE("ID Generation Logic") {
+        conn.send_request("req1", nullptr, [](auto) {});
+        conn.send_request("req2", nullptr, [](auto) {});
+
+        std::string output = out.str();
+        CHECK(output.find(R"("id":1)") != std::string::npos);
+        CHECK(output.find(R"("id":2)") != std::string::npos);
+    }
+}
+
+TEST_CASE("Conn: Raw Handler Interception") {
+    std::stringstream in, out, err;
+    Conn conn([]() {}, in, out, err);
+
+    bool intercepted = false;
+    conn.set_raw_handler([&](const IncomingMessage&, Conn&) {
+        intercepted = true;
+        return true;
+        });
+
+    conn.register_method("ping", [](const json&) { return "pong"; });
+    conn.start();
+    write_rpc_packet(in, R"({"jsonrpc":"2.0","method":"ping","id":1})");
+
+    std::this_thread::sleep_for(10ms);
+    conn.process_queue();
+
+    CHECK(intercepted);
+    CHECK(out.str().empty());
+}
+
+TEST_CASE("Conn: User Logic Exceptions") {
+    std::stringstream in, out, err;
+    Conn conn([]() {}, in, out, err);
+
+    conn.register_method("validate_age", [](const json& p) -> json {
+        int age = p[0].get<int>();
+        if (age < 0 || age > 150) {
+            throw JsonRpcException(spec::kInvalidParams, "Age must be between 0 and 150");
+        }
+        return "ok";
+        });
+
+    conn.register_method("crash_me", [](const json&) -> json {
+        throw std::runtime_error("Database connection lost");
+        });
+
+    conn.start();
+
+    SUBCASE("User-defined Protocol Error: Invalid Params (-32602)") {
+        write_rpc_packet(in, R"({"jsonrpc":"2.0","method":"validate_age","params":[-5],"id":10})");
+
+        std::this_thread::sleep_for(10ms);
+        conn.process_queue();
+
+        std::string output = out.str();
+        CHECK(output.find(R"("code":-32602)") != std::string::npos);
+        CHECK(output.find("Age must be between 0 and 150") != std::string::npos);
+        CHECK(output.find(R"("id":10)") != std::string::npos);
+    }
+
+    SUBCASE("Generic Exception: Internal Error (-32603)") {
+        write_rpc_packet(in, R"({"jsonrpc":"2.0","method":"crash_me","params":null,"id":20})");
+
+        std::this_thread::sleep_for(10ms);
+        conn.process_queue();
+
+        std::string output = out.str();
+        CHECK(output.find(R"("code":-32603)") != std::string::npos);
+        CHECK(output.find("Database connection lost") != std::string::npos);
+        CHECK(output.find(R"("id":20)") != std::string::npos);
+    }
+
+    conn.stop();
 }
