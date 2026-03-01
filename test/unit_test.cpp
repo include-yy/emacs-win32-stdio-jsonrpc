@@ -314,7 +314,7 @@ TEST_CASE("Conn: Protocol Robustness (Recoverable)") {
     SUBCASE("Broken JSON Body - Should stay alive and reply error") {
         write_rpc_packet(mock_in, R"({"jsonrpc":"2.0", "method": "test)");
         write_rpc_packet(mock_in, R"({"jsonrpc":"2.0", "method": "ping", "id": 2})");
-        
+
         std::this_thread::sleep_for(10ms);
         conn.process_queue();
         CHECK(mock_out.str().find("-32700") != std::string::npos);
