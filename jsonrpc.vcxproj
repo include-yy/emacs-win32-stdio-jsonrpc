@@ -135,7 +135,7 @@
     <ClInclude Include="include\jsonrpc.hpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="test\test.cpp" />
+    <ClCompile Include="test\unit_test.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
