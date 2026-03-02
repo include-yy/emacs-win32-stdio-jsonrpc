@@ -1,5 +1,7 @@
 * A simple JSON-RPC implementation in C++ for Emacs
 
+#+HTML: <img src="icon.jpg" align="right" width="25%">
+
 A lightweight, header-only JSON-RPC 2.0 server implementation for Windows.
 
 It serves as a bridge between Emacs and Windows-specific capabilities,
