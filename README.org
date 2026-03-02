@@ -181,6 +181,8 @@ Throw this inside a registered method to return a specific JSON-RPC error to the
 
 - =Constructor=: =JsonRpcException(int code, const char* message, json data = nullptr)=.
 - *Usage*: When caught by the Conn layer, it automatically generates a response using the provided code and message.
+  - =jsonrpc::spec::kInvalidParams= (-32602): Invalid method parameter(s).
+  - =jsonrpc::spec::kInternalError= (-32603): Internal JSON-RPC error or unhandled exception.
 
 *** *Structs*: =Request=, =Response=, and =Error=
 
@@ -191,6 +193,69 @@ These are the data structures used internally for serialization and passed to ha
 - =Response=: Contains =int id= and a variant of =json= (result) or =Error= (failure).
 
 - =Error=: Contains =int code=, =std::string message=, and optional =json data=.
+
+*** Advanced Interception
+
+- =using RawHandler = std::function<bool(const IncomingMessage&, Conn&)>=: A function type for intercepting messages before they are dispatched.
+- =void set_raw_handler(RawHandler handler)=: Registers an interceptor. If the handler returns =true=, the message is considered "consumed" and standard dispatch is skipped.
+- =using IncomingMessage = std::variant<Request, Response, Error>=: The type passed to the raw handler representing any valid JSON-RPC message.
+
+** Precautions
+
+*** Graceful Shutdown via EOF
+
+The =read_loop= is designed to terminate automatically upon receiving an EOF signal from the input stream. In an Emacs context, the most natural way to shut down the server is for the client (Emacs) to send EOF(=process-send-eof=), which triggers an EOF on the C++ side's =stdin=.
+
+*** Avoid Standard Output
+
+Since the library uses =stdout= as the primary communication channel for JSON-RPC packets, never use =std::cout= (or =printf=) for logging or debugging. Doing so will inject plain text into the binary stream, causing the Emacs side to fail parsing. Use =std::cerr= for all logging.
+
+*** Threading and Lifecycle
+
+- Handler Execution: All methods registered via =register_method= or =register_async_method= are executed inside =process_queue()=. This ensures your business logic runs on the thread that calls that function (usually the main UI thread).
+
+- Thread Safety: While =Context::reply()= and =Context::error()= are thread-safe (utilizing =std::osyncstream=), registration methods like =register_method= must be called before calling =start()=.
+
+- The Waker: The =Waker= callback is executed on the background reader thread. It should only be used to signal the main thread (e.g., via =PostThreadMessage=) and should not perform heavy logic.
+
+*** Windows Stdio Quirks
+
+- Binary Mode: The library automatically sets =stdin/stdout/stderr= to =_O_BINARY=. If you bypass the library to read or write to these streams, ensure you do not change the mode back to text, as it will corrupt the =Content-Length= byte counts.
+
+- Graceful Exit: On Windows, the reader thread often blocks on a synchronous =ReadFile= call. To shut down cleanly without waiting for an EOF from Emacs, you must use =CancelIoEx= as shown in the example to unblock the thread before calling =stop()=.
+  
+*** Protocol Constraints
+
+- Packet Size: The default maximum packet size is 16MB. If you are transmitting large data (like high-res images or large buffers), increase this limit in the =Conn= constructor.
+
+- UTF-8: The JSON-RPC specification requires UTF-8 encoding. Ensure any strings passed to the library are properly encoded.
+
+*** Error Codes
+
+While the library handles protocol-level errors automatically, you can refer to the =jsonrpc::spec= namespace for standard codes:
+
+- =-32700=: Parse error (Invalid JSON).
+- =-32600=: Invalid Request.
+- =-32601=: Method not found.
+- =-32603=: Internal error (caught C++ exception).
+
+** Testing
+
+The project includes two levels of testing to ensure protocol compliance and I/O robustness.
+
+*** 1. Unit Tests (=unit_test.cpp=)
+
+Uses the =doctest= framework to verify:
+
+- Serialization: Correctness of =Request=, =Response=, and =Error= JSON mapping.
+- Protocol Logic: Validation of standard error codes (-32700, -32600, etc.).
+
+*** 2. Integration Tests (=client_test.py=)
+
+A Python-based smoke test that simulates a real Emacs environment to verify:
+
+- Sticky Packets: Handling multiple JSON-RPC messages delivered in a single read.
+- Split Packets: Recovery when a single message is fragmented across multiple read operations.
 
 ** Why this project?
 
