@@ -119,3 +119,79 @@ When connecting from Emacs, *must* set the coding system to binary.  Failure to 
   ;;=> exit subprocess
 #+end_src
 
+** API Reference
+
+*Namespace*: =jsonrpc=
+
+All core functionality resides within the =jsonrpc= namespace. This includes the main connection class, message structures, and standard error specifications.
+
+*** *Class* =jsonrpc::Conn=
+
+The primary interface for managing JSON-RPC communication over standard I/O.
+
+#+begin_src cpp
+  Conn(Waker waker, 
+       std::istream& input = std::cin, 
+       std::ostream& output = std::cout, 
+       std::ostream& error = std::cerr, 
+       size_t max_pkg_size = kDefaultMaxContentLength);
+#+end_src
+
+- =waker=: A =std::function<void()>= called whenever a new message is pushed to the inbox. Use this to signal your main event loop to call =process_queue()=.
+- =input/output/error=: The streams used for communication. On Windows, if these are =std::cin/cout/cerr=, they are automatically set to =_O_BINARY= mode.
+- =max_pkg_size=: The maximum allowed =Content-Length=. Packets exceeding this are rejected to prevent memory exhaustion (Default: 16MB).
+
+*Lifecycle Management*
+
+- =void start()=: Launches the background reader thread. The thread continuously parses incoming LSP-framed packets and populates the inbox queue.
+- =void stop()=: Signals the reader thread to exit and joins it. Note: In synchronous I/O scenarios, you may need to use =CancelIoEx= before calling this to unblock the thread.
+- =bool is_running()=: Returns =true= if the reader thread is active.
+
+*Method Registration*
+
+- =void register_method(const std::string& name, RequestHandler handler)=: Registers a synchronous method.
+  - =handler=: =std::function<json(const json& params)>=.
+  - The return value is automatically sent back as a JSON-RPC result.
+- =void register_async_method(const std::string& name, AsyncRequestHandler handler)=: Registers an asynchronous method.
+  - =handler=: =std::function<void(Context ctx, const json& params)>=.
+  - Execution completes only when =ctx.reply()= or =ctx.error()= is called.
+- =void register_notification(const std::string& name, NotificationHandler handler)=: Registers a handler for notifications (requests without an =id=).
+- =handler=: =std::function<void(const json& params)>=.
+
+*Execution & Outbound*
+
+- =void process_queue()=: Drains the inbox queue and executes the corresponding handlers. *Must be called on the thread where you want your business logic to run*.
+
+- =void send_request(const std::string& method, const json& params, ResponseHandler callback)=: Sends a request to the client. The =callback= is executed when a response with the matching =id= is processed.
+
+- =void send_notification(const std::string& method, const json& params)=: Sends a notification to the client.  
+
+*** *Class* =jsonrpc::Context=
+
+A handle passed to asynchronous handlers to provide a response at a later time.
+
+- =void reply(json result)=: Sends a success response with the given result.
+- =void error(int code, std::string message, json data = nullptr)=: Sends an error response.
+- =std::optional<int> id()=: Returns the id of the current request.
+- =bool is_notification()=: Returns true if the incoming message has no id.
+
+*** *Exception* =jsonrpc::JsonRpcException=
+
+Throw this inside a registered method to return a specific JSON-RPC error to the client.
+
+- =Constructor=: =JsonRpcException(int code, const char* message, json data = nullptr)=.
+- *Usage*: When caught by the Conn layer, it automatically generates a response using the provided code and message.
+
+*** *Structs*: =Request=, =Response=, and =Error=
+
+These are the data structures used internally for serialization and passed to handlers.
+
+- =Request=: Contains =std::optional<int> id=, =std::string method=, and =json params=.
+
+- =Response=: Contains =int id= and a variant of =json= (result) or =Error= (failure).
+
+- =Error=: Contains =int code=, =std::string message=, and optional =json data=.
+
+** Why this project?
+
+Just for fun.
