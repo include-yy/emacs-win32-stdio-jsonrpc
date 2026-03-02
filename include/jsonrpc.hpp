@@ -393,20 +393,26 @@ public:
     // Stop the reader thread and cleanup.
     void stop() {
         running_ = false;
-        if (reader_thread_.joinable()) reader_thread_.detach();
+        if (reader_thread_.joinable()) {
+            reader_thread_.join();
+        }
     }
 
     // Set a raw handler to intercept all incoming messages (advanced usage).
     // If the handler returns true, the message is considered handled and won't
     // be processed further.
     void set_raw_handler(RawHandler handler) {
-        std::lock_guard<std::mutex> lock(map_mutex_);
+        if (running_) {
+            throw std::runtime_error("JSON-RPC Error: Cannot register methods after server start");
+        }
         raw_handler_ = std::move(handler);
     }
 
     // Register an async method.
     void register_async_method(const std::string& name, AsyncRequestHandler handler) {
-        std::lock_guard<std::mutex> lock(map_mutex_);
+        if (running_) {
+            throw std::runtime_error("JSON-RPC Error: Cannot register methods after server start");
+        }
         method_handlers_[name] = handler;
     }
 
@@ -443,7 +449,7 @@ public:
     void send_request(const std::string& method, const json& params, ResponseHandler callback) {
         int id = next_id_++;
         {
-            std::lock_guard<std::mutex> lock(map_mutex_);
+            std::lock_guard<std::mutex> lock(callback_mutex_);
             pending_callbacks_[id] = callback;
         }
         Request req{ id, method, params };
@@ -479,13 +485,8 @@ public:
         IncomingMessage msg;
         while (inbox_.try_pop(msg)) {
             // 1. Raw Handler Interception.
-            RawHandler handler_copy = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(map_mutex_);
-                handler_copy = raw_handler_;
-            }
-            if (handler_copy) {
-                if (handler_copy(msg, *this)) {
+            if (raw_handler_) {
+                if (raw_handler_(msg, *this)) {
                     continue;
                 }
             }
@@ -517,7 +518,7 @@ private:
     size_t max_content_length_;
 
     ThreadSafeQueue<IncomingMessage> inbox_;
-    std::mutex map_mutex_;
+    std::mutex callback_mutex_;
     RawHandler raw_handler_;
     std::map<std::string, AsyncRequestHandler> method_handlers_;
     std::map<int, ResponseHandler> pending_callbacks_;
@@ -553,12 +554,9 @@ private:
     }
 
     void handle_request(const Request& req) {
-        AsyncRequestHandler handler = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(map_mutex_);
-            if (method_handlers_.count(req.method)) {
-                handler = method_handlers_[req.method];
-            }
+        AsyncRequestHandler handler;
+        if (method_handlers_.count(req.method)) {
+            handler = method_handlers_[req.method];
         }
 
         if (handler) {
@@ -586,7 +584,7 @@ private:
     void handle_response(const Response& resp) {
         ResponseHandler callback = nullptr;
         {
-            std::lock_guard<std::mutex> lock(map_mutex_);
+            std::lock_guard<std::mutex> lock(callback_mutex_);
             auto it = pending_callbacks_.find(resp.id);
             if (it != pending_callbacks_.end()) {
                 callback = std::move(it->second);
@@ -595,6 +593,7 @@ private:
         }
         if (callback) callback(resp);
     }
+
     void read_loop() {
         // Exit Guarder.
         struct ScopeExit {
@@ -623,7 +622,7 @@ private:
             // 1. Read header.
             while (true) {
                 auto line = read_header_line();
-                if (!line) return;  // EOF
+                if (!line) return; // EOF
                 if (line->empty()) break;  // End of headers.
 
                 if (line->starts_with("Content-Length:")) {
@@ -650,7 +649,12 @@ private:
             in_.read(buffer.data(), content_length);
 
             // Make sure we read the exact number of bytes specified.
-            if (in_.gcount() != (std::streamsize)content_length) break;
+            if (in_.gcount() != (std::streamsize)content_length) {
+                err_ << "[JSON-RPC FATAL] Incomplete body read. "
+                    << "Expected " << content_length << " bytes, but only got " << in_.gcount()
+                    << ". Closing connection." << std::endl;
+                return;
+            }
 
             // 3. Parse and Push.
             try {
